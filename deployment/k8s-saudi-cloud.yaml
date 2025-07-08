@@ -1,0 +1,563 @@
+# Kubernetes deployment for Saudi Cloud Providers
+# Compliant with Saudi Data Protection Law (DPL) and data residency requirements
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: contract-management
+  labels:
+    compliance: saudi-data-residency
+    classification: confidential
+    data-region: saudi-arabia
+  annotations:
+    saudi.gov.sa/dpl-compliant: "true"
+    saudi.gov.sa/data-classification: "confidential"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-secrets
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: database
+type: Opaque
+stringData:
+  database-url: "postgresql://contract_user:CHANGE_THIS_PASSWORD@postgres-service:5432/contract_management"
+  postgres-password: "CHANGE_THIS_PASSWORD"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: application
+type: Opaque
+stringData:
+  secret-key: "CHANGE_THIS_SECRET_KEY_MINIMUM_32_CHARS"
+  openai-api-key: ""  # Optional: Leave empty to use local AI
+  docusign-key: ""    # Optional: Leave empty to use mock signatures
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: contract-management
+  labels:
+    app: contract-management
+data:
+  # Saudi compliance settings
+  DATA_REGION: "saudi-arabia"
+  ENCRYPTION_AT_REST: "true"
+  AUDIT_LOGGING: "true"
+  DATA_RETENTION_DAYS: "2555"  # 7 years as per Saudi regulations
+  SAUDI_DPL_COMPLIANCE: "true"
+  DATA_CLASSIFICATION: "confidential"
+  
+  # Application settings
+  DEBUG: "false"
+  APP_NAME: "Contract Management System - Saudi Cloud"
+  ACCESS_TOKEN_EXPIRE_MINUTES: "60"
+  
+  # Performance settings
+  WORKERS: "4"
+  MAX_REQUESTS: "1000"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: database
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: saudi-ssd  # Use Saudi cloud storage class
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads-pvc
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: saudi-shared  # Use Saudi shared storage
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: database
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: contract-management
+      tier: database
+  template:
+    metadata:
+      labels:
+        app: contract-management
+        tier: database
+      annotations:
+        saudi.gov.sa/data-classification: "confidential"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+      - name: postgres
+        image: postgres:15-alpine
+        env:
+        - name: POSTGRES_DB
+          value: contract_management
+        - name: POSTGRES_USER
+          value: contract_user
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-secrets
+              key: postgres-password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+          name: postgres
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - contract_user
+            - -d
+            - contract_management
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - contract_user
+            - -d
+            - contract_management
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: database
+spec:
+  selector:
+    app: contract-management
+    tier: database
+  ports:
+  - port: 5432
+    targetPort: 5432
+    name: postgres
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: contract-management
+      tier: cache
+  template:
+    metadata:
+      labels:
+        app: contract-management
+        tier: cache
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command:
+        - redis-server
+        - --appendonly
+        - "yes"
+        - --requirepass
+        - "$(REDIS_PASSWORD)"
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: secret-key
+        ports:
+        - containerPort: 6379
+          name: redis
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "200m"
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: cache
+spec:
+  selector:
+    app: contract-management
+    tier: cache
+  ports:
+  - port: 6379
+    targetPort: 6379
+    name: redis
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: contract-app
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: application
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: contract-management
+      tier: application
+  template:
+    metadata:
+      labels:
+        app: contract-management
+        tier: application
+      annotations:
+        saudi.gov.sa/data-classification: "confidential"
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: contract-app
+        image: your-saudi-registry.sa/contract-management:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-secrets
+              key: database-url
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: secret-key
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: openai-api-key
+        - name: DOCUSIGN_INTEGRATION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: docusign-key
+        - name: REDIS_URL
+          value: "redis://:$(SECRET_KEY)@redis-service:6379/0"
+        envFrom:
+        - configMapRef:
+            name: app-config
+        volumeMounts:
+        - name: uploads-storage
+          mountPath: /app/uploads
+        - name: logs-storage
+          mountPath: /app/logs
+        - name: tmp-storage
+          mountPath: /tmp
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        # Security context
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: uploads-storage
+        persistentVolumeClaim:
+          claimName: uploads-pvc
+      - name: logs-storage
+        emptyDir: {}
+      - name: tmp-storage
+        emptyDir: {}
+      # Node affinity for Saudi data centers
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: saudi.gov.sa/data-center
+                operator: Exists
+              - key: topology.kubernetes.io/region
+                operator: In
+                values:
+                - saudi-central
+                - saudi-east
+                - saudi-west
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: contract-service
+  namespace: contract-management
+  labels:
+    app: contract-management
+    tier: application
+  annotations:
+    saudi.gov.sa/load-balancer-type: "internal"
+spec:
+  selector:
+    app: contract-management
+    tier: application
+  ports:
+  - port: 80
+    targetPort: 8000
+    name: http
+  type: LoadBalancer
+  loadBalancerSourceRanges:
+  - 10.0.0.0/8      # Only allow internal traffic
+  - 172.16.0.0/12   # Private network ranges
+  - 192.168.0.0/16  # Local networks
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: contract-network-policy
+  namespace: contract-management
+spec:
+  podSelector:
+    matchLabels:
+      app: contract-management
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: contract-management
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 6379
+  egress:
+  - to: []  # Allow all egress for AI services (can be restricted)
+    ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: contract-management
+    ports:
+    - protocol: TCP
+      port: 5432
+    - protocol: TCP
+      port: 6379
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: contract-app-pdb
+  namespace: contract-management
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: contract-management
+      tier: application
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: contract-app-hpa
+  namespace: contract-management
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: contract-app
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 20
+        periodSeconds: 60
+---
+# RBAC for Saudi compliance monitoring
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: saudi-compliance-monitor
+  namespace: contract-management
+  labels:
+    app: contract-management
+    component: compliance
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: saudi-compliance-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services", "endpoints", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: saudi-compliance-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: saudi-compliance-reader
+subjects:
+- kind: ServiceAccount
+  name: saudi-compliance-monitor
+  namespace: contract-management
